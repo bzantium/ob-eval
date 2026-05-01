@@ -100,9 +100,160 @@ def process_single_llm_result(llm_result, metadata, call_index):
             'precision': 0.0, 'recall': 0.0, 'f1': 0.0
         }
 
+def build_evaluation_requests(predicted_calls: List[Dict],
+                              actual_calls: List[Dict],
+                              eval_config: Dict,
+                              system_info: str = "",
+                              llm_history: List[Dict] = None,
+                              tool_descriptions: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Build per-call LLM judge requests without invoking the judge.
+
+    Returns a dict with three keys:
+    - ``requests``: list of OpenAI-style ``messages`` lists, one per call that
+      needs LLM judging
+    - ``metadata``: parallel list of metadata dicts that
+      ``process_evaluation_responses`` consumes to merge auto-results with
+      the judge's verdicts
+    - ``auto_only_results``: pre-computed result dicts for calls that didn't
+      need LLM judging (rejection cases, failed predictions, or all-auto
+      argument matches)
+    """
+    skip_llm_eval = eval_config.get("skip_llm_eval", False)
+    requests: List[List[Dict]] = []
+    metadata: List[Dict] = []
+    auto_only_results: List[Dict] = []
+    if not predicted_calls or not actual_calls:
+        return {"requests": requests, "metadata": metadata, "auto_only_results": auto_only_results}
+
+    for global_idx in range(len(predicted_calls)):
+        p_call = predicted_calls[global_idx]
+        a_call = actual_calls[global_idx]
+        history = llm_history[global_idx] if llm_history else None
+        call_index = global_idx
+        applied_tool_desc = {
+            function_name: tool_descriptions[function_name]
+            for function_name in p_call["function_name"]
+            if function_name in tool_descriptions
+        }
+
+        if (
+            is_rejection_case(a_call, "label")
+            or is_rejection_case(p_call, "prediction")
+            or is_failed_case(p_call)
+        ):
+            continue
+
+        analysis = analyze_argument_matches(p_call, a_call, applied_tool_desc)
+        auto_results = analysis["auto_results"]
+        llm_needed = analysis["llm_needed"]
+
+        if not llm_needed or skip_llm_eval:
+            final_result = combine_analysis_with_llm_results(analysis, {}, {})
+            auto_only_results.append({
+                "call_index": call_index,
+                "precision": final_result["metrics"]["precision"],
+                "recall": final_result["metrics"]["recall"],
+                "f1": final_result["metrics"]["f1"],
+            })
+            continue
+
+        llm_prompt, number_mapping = create_llm_judge_prompt(llm_needed)
+        system_prompt = eval_config["prompts"]["arguments_evaluation"]["prompt"]
+        system_prompt = system_prompt.replace("%%system_info%%", system_info)
+        system_prompt = system_prompt.replace(
+            "%%tool_description%%", json.dumps(applied_tool_desc, indent=2, ensure_ascii=False)
+        )
+        if history:
+            history.insert(0, {"role": "system", "content": system_prompt})
+        else:
+            history = [{"role": "system", "content": system_prompt}]
+        llm_prompt = "</history>\n\n" + llm_prompt
+        history = history + [{"role": "user", "content": llm_prompt}]
+
+        # ``[ID: ...]`` pairs the response back to the request — when the
+        # judge processes a batch of requests, the IDs let us re-align by
+        # content rather than relying on the call-time ordering.
+        batch_id = f"EVAL_BATCH_{call_index}_{global_idx}"
+        history_with_id = history.copy()
+        history_with_id[-1]["content"] = (
+            f"[ID: {batch_id}]\n\n"
+            + history_with_id[-1]["content"]
+            + f"\n\n**IMPORTANT: Always start your response with [ID: {batch_id}]**"
+        )
+
+        requests.append(history_with_id)
+        metadata.append({
+            "call_index": call_index,
+            "batch_id": batch_id,
+            "p_call": p_call,
+            "a_call": a_call,
+            "auto_results": auto_results,
+            "llm_needed": llm_needed,
+            "number_mapping": number_mapping,
+            "applied_tool_desc": applied_tool_desc,
+            "history": history,
+        })
+
+    return {"requests": requests, "metadata": metadata, "auto_only_results": auto_only_results}
+
+
+def process_evaluation_responses(metadata: List[Dict],
+                                 llm_results: List[Any],
+                                 auto_only_results: List[Dict] = None,
+                                 save_results: bool = False,
+                                 output_dir: str = None,
+                                 file_identifier: str = None,
+                                 input_data_for_saving: List[Dict] = None) -> List[Dict]:
+    """Merge auto-results with judge responses to produce per-call F1 dicts.
+
+    ``llm_results[i]`` is the judge's response for ``metadata[i]``'s request.
+    A response can be the OpenAI-style dict from ``_call_llm`` or a raw
+    string — ``extract_content_from_llm_result`` handles both.
+    """
+    all_results: List[Dict] = list(auto_only_results or [])
+    llm_responses: List[Dict] = []
+    for llm_result, meta in zip(llm_results, metadata):
+        call_index = meta["call_index"]
+        batch_id = meta["batch_id"]
+        try:
+            response_id = None
+            if llm_result and not isinstance(llm_result, Exception):
+                content = extract_content_from_llm_result(llm_result)
+                id_match = re.search(r"\[ID:\s*([^\]]+)\]", content)
+                if id_match:
+                    response_id = id_match.group(1).strip()
+            if response_id != batch_id:
+                logger.error(
+                    "ID mismatch for call %s. Expected %s, got %s. "
+                    "Falling back to position-based matching.",
+                    call_index, batch_id, response_id,
+                )
+            result = process_single_llm_result(llm_result, meta, call_index)
+            all_results.append(result)
+            if save_results:
+                llm_responses.append({
+                    "call_index": call_index,
+                    "llm_response": llm_result,
+                    "parsed_judgement": result.get("parsed_judgement", {}),
+                    "final_metrics": result,
+                })
+        except Exception as e:
+            logger.error("Error processing batch result %s: %s", call_index, e)
+            all_results.append({
+                "call_index": call_index,
+                "error": str(e),
+                "precision": 0.0, "recall": 0.0, "f1": 0.0,
+            })
+
+    if save_results and output_dir and file_identifier and input_data_for_saving is not None:
+        save_llm_results(input_data_for_saving, llm_responses, output_dir, file_identifier)
+
+    return all_results
+
+
 async def call_evaluation_llm(predicted_calls: List[Dict],
                                 actual_calls: List[Dict],
-                                eval_config : Dict,
+                                eval_config: Dict,
                                 judge_call: JudgeCallable,
                                 system_info: str = "",
                                 llm_history: List[Dict] = None,
@@ -110,162 +261,45 @@ async def call_evaluation_llm(predicted_calls: List[Dict],
                                 save_results: bool = False,
                                 output_dir: str = None,
                                 file_identifier: str = None) -> List[Dict]:
+    """Live-judge variant: build → call judge → process. Kept for backwards
+    compatibility; consumers preferring a pre-cached judge pipeline should
+    call ``build_evaluation_requests`` and ``process_evaluation_responses``
+    directly.
     """
-    Call evaluation LLM for argument comparison with concurrency control and batch processing.
-    Optionally save input/output data for analysis.
-    """
-    skip_llm_eval = eval_config.get("skip_llm_eval", False)
-    max_concurrent = eval_config.get("max_concurrent", 3)  # Reduced for better order preservation
-    batch_size = eval_config.get("batch_size", 8)  # Smaller batches for better matching
+    built = build_evaluation_requests(
+        predicted_calls, actual_calls, eval_config,
+        system_info=system_info, llm_history=llm_history,
+        tool_descriptions=tool_descriptions,
+    )
+    requests = built["requests"]
+    metadata = built["metadata"]
+    auto_only_results = built["auto_only_results"]
 
-    # Prepare data for saving if requested
-    input_data = []
-    llm_responses = []
+    if not requests:
+        return auto_only_results
 
-    if not predicted_calls or not actual_calls:
-        return []
-    
-    total_calls = len(predicted_calls)
-    all_results = []    
-    
-    # Collect all LLM requests for batch processing
-    batch_requests = []
-    batch_metadata = []
-    
-    # First pass: prepare all requests
-    for global_idx in range(len(predicted_calls)):
-        p_call = predicted_calls[global_idx]
-        a_call = actual_calls[global_idx]
-        history = llm_history[global_idx] if llm_history else None
-        call_index = global_idx
-        applied_tool_desc = {function_name: tool_descriptions[function_name] for function_name in p_call['function_name'] if function_name in tool_descriptions}
+    batch_size = eval_config.get("batch_size", 8)
+    llm_results: List[Any] = []
+    input_data_for_saving: List[Dict] = []
+    if save_results:
+        for meta in metadata:
+            input_data_for_saving.append({
+                "call_index": meta["call_index"],
+                "predicted_call": meta["p_call"],
+                "actual_call": meta["a_call"],
+                "auto_results": meta["auto_results"],
+                "messages": meta["history"],
+            })
+    for batch_start in range(0, len(requests), batch_size):
+        batch_end = min(batch_start + batch_size, len(requests))
+        tasks = [_call_llm_with_semaphore(req, judge_call) for req in requests[batch_start:batch_end]]
+        llm_results.extend(await asyncio.gather(*tasks, return_exceptions=True))
 
-        if not is_rejection_case(a_call, 'label') and not is_rejection_case(p_call, 'prediction') and not is_failed_case(p_call):
-            analysis = analyze_argument_matches(p_call, a_call, applied_tool_desc)
-            auto_results = analysis['auto_results']
-            llm_needed = analysis['llm_needed']
-            
-            if llm_needed and not skip_llm_eval:
-                llm_prompt, number_mapping = create_llm_judge_prompt(llm_needed)
-                system_prompt = eval_config["prompts"]["arguments_evaluation"]["prompt"]
-                system_prompt = system_prompt.replace("%%system_info%%", system_info)
-                system_prompt = system_prompt.replace("%%tool_description%%", json.dumps(applied_tool_desc, indent=2, ensure_ascii=False))
-                if history:
-                    history.insert(0, {"role": "system", "content": system_prompt})
-                else:
-                    history = [{"role": "system", "content": system_prompt}]
-                llm_prompt = "</history>\n\n" + llm_prompt
-                history = history + [{"role": "user", "content": llm_prompt}]
-                
-                # Add unique identifier to the prompt for batch processing
-                batch_id = f"EVAL_BATCH_{call_index}_{global_idx}"
-                history_with_id = history.copy()
-                history_with_id[-1]["content"] = f"[ID: {batch_id}]\n\n" + history_with_id[-1]["content"] + f"\n\n**IMPORTANT: Always start your response with [ID: {batch_id}]**"
-                
-                # Store for batch processing
-                batch_requests.append(history_with_id)
-                batch_metadata.append({
-                    "call_index": call_index,
-                    "batch_id": batch_id,
-                    "p_call": p_call,
-                    "a_call": a_call,
-                    "auto_results": auto_results,
-                    "llm_needed": llm_needed,
-                    "number_mapping": number_mapping,
-                    "applied_tool_desc": applied_tool_desc,
-                    "history": history
-                })
-                
-                # Store input data for saving
-                if save_results:
-                    input_data.append({
-                        "call_index": call_index,
-                        "predicted_call": p_call,
-                        "actual_call": a_call,
-                        "auto_results": auto_results,
-                        "llm_prompt": llm_prompt,
-                        "messages": history 
-                    })
-    
-    # Second pass: execute batch LLM calls
-    if batch_requests:
-        for batch_start in range(0, len(batch_requests), batch_size):
-            batch_end = min(batch_start + batch_size, len(batch_requests))
-            current_batch = batch_requests[batch_start:batch_end]
-            current_metadata = batch_metadata[batch_start:batch_end]
-            # Execute batch of LLM calls concurrently
-            tasks = [_call_llm_with_semaphore(request, judge_call) for request in current_batch]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Process batch results with ID matching
-            for i, (llm_result, metadata) in enumerate(zip(batch_results, current_metadata)):
-                call_index = metadata["call_index"]
-                batch_id = metadata["batch_id"]
-                
-                try:
-                    # Verify response matches request by checking ID
-                    response_id = None
-                    if llm_result and not isinstance(llm_result, Exception):
-                        content = extract_content_from_llm_result(llm_result)
-                        id_match = re.search(r'\[ID:\s*([^\]]+)\]', content)
-                        if id_match:
-                            response_id = id_match.group(1).strip()
-                    
-                    if response_id != batch_id:
-                        logger.error(f"Warning: ID mismatch for call {call_index}. Expected: {batch_id}, Got: {response_id}. Using position-based matching.")
-                        # Use position-based matching as fallback
-                    
-                    result = process_single_llm_result(llm_result, metadata, call_index)
-                    all_results.append(result)
-                    
-                    # Save LLM response if requested
-                    if save_results:
-                        llm_responses.append({
-                            "call_index": call_index,
-                            "llm_response": llm_result,
-                            "parsed_judgement": result.get('parsed_judgement', {}),
-                            "final_metrics": result
-                        })
-                    
-                except Exception as e:
-                    logger.error(f"Error processing batch result {call_index}: {e}")
-                    error_result = {
-                        'call_index': call_index,
-                        'error': str(e),
-                        'precision': 0.0, 'recall': 0.0, 'f1': 0.0
-                    }
-                    all_results.append(error_result)
-    
-    # Process non-LLM cases (auto-only results)
-    for global_idx in range(len(predicted_calls)):
-        p_call = predicted_calls[global_idx]
-        a_call = actual_calls[global_idx]
-        call_index = global_idx
-        applied_tool_desc = {function_name: tool_descriptions[function_name] for function_name in p_call['function_name'] if function_name in tool_descriptions}
-
-        if not is_rejection_case(a_call, 'label') and not is_rejection_case(p_call, 'prediction') and not is_failed_case(p_call):
-            analysis = analyze_argument_matches(p_call, a_call, applied_tool_desc)
-            auto_results = analysis['auto_results']
-            llm_needed = analysis['llm_needed']
-            
-            # Skip if already processed in batch
-            if not llm_needed or skip_llm_eval:
-                final_result = combine_analysis_with_llm_results(analysis, {}, {})
-                result = {
-                    'call_index': call_index,
-                    'precision': final_result['metrics']['precision'],
-                    'recall': final_result['metrics']['recall'],
-                    'f1': final_result['metrics']['f1']
-                }
-                all_results.append(result)
-
-    # Save all LLM data if requested
-    if save_results and output_dir and file_identifier:
-        save_llm_results(input_data, llm_responses, output_dir, file_identifier)
-    del(input_data)
-    del(llm_responses)
-
-    return all_results
+    return process_evaluation_responses(
+        metadata, llm_results, auto_only_results=auto_only_results,
+        save_results=save_results, output_dir=output_dir, file_identifier=file_identifier,
+        input_data_for_saving=input_data_for_saving,
+    )
 
 def calculate_function_name_score(predicted_calls: List[Dict], actual_calls: List[Dict], total_label_function_call_count: int) -> Dict[str, Any]:
     """Calculate function name accuracy score by comparing predicted and actual function calls.
@@ -490,109 +524,274 @@ async def evaluate_sub_agent_history_f1(data: Dict,
                                         save_llm_results: bool = False,
                                         output_dir: str = None,
                                         file_identifier: str = None,) -> Dict:
-    """
-    Main evaluation function: compares sub_agent_history and label to calculate F1 score.
-    """
+    """Live-judge variant of the F1 scoring.
 
-    num_runs = len(data["history"])
-    total_key_scores = 0.0
-    total_function_name_scores = 0.0
-    total_rejection_cases = 0.0
-    total_function_call_cases = 0.0
-    total_value_scores_without_rejection = 0.0
-    total_all_fc_successful_calls = 0.0
-    total_true_positive_reject = 0.0
-    total_true_negative_reject = 0.0
-    total_false_positive_reject = 0.0
-    total_false_negative_reject = 0.0
-    total_true_positive_fc = 0  # FC True Positive 누적
-    total_false_positive_fc = 0  # FC False Positive 누적
-    total_false_negative_fc = 0  # FC False Negative 누적
-    total_true_negative_fc = 0  # FC True Negative 누적
-    total_rejection_type_mismatch = 0  # Rejection 타입 불일치 누적
-    total_failed_generation = 0  # 예측 생성 실패 누적
+    For pre-cached judge responses (the harness's standard judge-pipeline
+    pattern), call ``build_judge_requests`` to obtain the prompts and
+    ``score_with_judgements`` to compute the same metrics from the
+    responses without an active judge connection.
+    """
+    return await _aggregate_trials(
+        data, eval_config, tool_descriptions,
+        judge_call=judge_call,
+        save_llm_results=save_llm_results,
+        output_dir=output_dir,
+        file_identifier=file_identifier,
+    )
 
-    total_perfect_successful_calls = 0.0
-    llm_failed_trials = []
+def _walk_trials(data: Dict, eval_config: Dict, tool_descriptions: Dict):
+    """Yield ``(trial, ctx)`` where ``ctx`` collects everything a per-trial
+    scoring or request-build step needs: extracted tool calls, histories,
+    pre-computed key/function-name scores, plus the rejection / FC
+    confusion-matrix counters that aggregate at the end of
+    ``evaluate_sub_agent_history_f1`` / ``score_with_judgements``.
+    """
     for trial in data["history"]:
         data_run = data["history"][trial]
         sub_agent_history = data_run["sub_agent_history"]
         label_history = data_run["label"]
         system_info = label_history["1"]["content"] if label_history["1"]["role"] == "system" else ""
 
-        # Extract tool calls except tool call is different in label and prediction
         (predicted_calls, actual_calls, step_list,
-            false_negative_reject,  # Type1 errors
-            false_positive_reject,  # Type2 errors
-            true_positive_reject,
-            true_negative_reject,
-            true_positive_fc,  # FC True Positive (실제 FC, 예측 FC)
-            false_positive_fc,  # FC False Positive (실제 reject, 예측 FC)
-            false_negative_fc,  # FC False Negative (실제 FC, 예측 reject)
-            true_negative_fc,  # FC True Negative (실제 reject, 예측 reject)
-            total_label_reject_cases,
-            total_label_fc_cases,
-            rejection_type_mismatch,
-            failed_generation) = \
-                            extract_both_tool_calls(sub_agent_history, label_history)
+            false_negative_reject, false_positive_reject,
+            true_positive_reject, true_negative_reject,
+            true_positive_fc, false_positive_fc, false_negative_fc, true_negative_fc,
+            total_label_reject_cases, total_label_fc_cases,
+            rejection_type_mismatch, failed_generation) = \
+                extract_both_tool_calls(sub_agent_history, label_history)
+        assert len(predicted_calls) == len(actual_calls), \
+            f"Mismatch in number of tool calls for trial {trial}"
 
         histories = [create_history(data_run, step) for step in step_list]
-        assert len(predicted_calls) == len(actual_calls), f"Mismatch in number of tool calls for trial {trial}"
-        # Tool calls 매칭
-        # matched_pairs = match_tool_calls_by_similarity(predicted_calls, actual_calls)    
         key_score_result = calculate_key_score(predicted_calls, actual_calls)
-
-        # Calculate function name score using existing function
-        function_name_result = calculate_function_name_score(predicted_calls, actual_calls, total_label_fc_cases)
-        
-        # Accumulate statistics
-        total_key_scores += key_score_result["avg_f1"]
-
-        total_function_name_scores += function_name_result["f1-score"] 
-        total_rejection_cases += total_label_reject_cases
-        total_true_positive_reject += true_positive_reject
-        total_true_negative_reject += true_negative_reject
-        total_false_positive_reject += false_positive_reject
-        total_false_negative_reject += false_negative_reject
-        total_true_positive_fc += true_positive_fc
-        total_false_positive_fc += false_positive_fc
-        total_false_negative_fc += false_negative_fc
-        total_true_negative_fc += true_negative_fc
-        total_rejection_type_mismatch += rejection_type_mismatch
-        total_failed_generation += failed_generation
-
-        total_function_call_cases += total_label_fc_cases
-
-        value_score, perfect_pred_fc_calls, llm_eval_success = await calculate_argument_value_scores(
-            predicted_calls, actual_calls, histories, eval_config,
-            system_info, tool_descriptions, save_llm_results,
-            output_dir, file_identifier, trial, key_score_result, judge_call,
+        function_name_result = calculate_function_name_score(
+            predicted_calls, actual_calls, total_label_fc_cases
         )
-        total_perfect_successful_calls += perfect_pred_fc_calls
-        total_value_scores_without_rejection += value_score
-        total_all_fc_successful_calls += true_negative_reject
-        if not llm_eval_success: llm_failed_trials.append(trial)
+
+        # Filter to pairs that the LLM judge will actually evaluate (same
+        # rejection/failed gates ``calculate_argument_value_scores`` uses).
+        llm_eligible_indices: List[int] = []
+        llm_eligible_predicted: List[Dict] = []
+        llm_eligible_actual: List[Dict] = []
+        llm_eligible_history: List[Dict] = []
+        for idx in range(len(predicted_calls)):
+            p_call = predicted_calls[idx]
+            a_call = actual_calls[idx]
+            if (
+                not is_rejection_case(a_call, "label")
+                and not is_rejection_case(p_call, "prediction")
+                and not is_failed_case(p_call)
+            ):
+                llm_eligible_indices.append(idx)
+                llm_eligible_predicted.append(p_call)
+                llm_eligible_actual.append(a_call)
+                llm_eligible_history.append(histories[idx])
+
+        ctx = {
+            "predicted_calls": predicted_calls,
+            "actual_calls": actual_calls,
+            "histories": histories,
+            "system_info": system_info,
+            "key_score_result": key_score_result,
+            "function_name_result": function_name_result,
+            "llm_eligible_indices": llm_eligible_indices,
+            "llm_eligible_predicted": llm_eligible_predicted,
+            "llm_eligible_actual": llm_eligible_actual,
+            "llm_eligible_history": llm_eligible_history,
+            # confusion-matrix counters (forwarded as-is to the aggregator)
+            "false_negative_reject": false_negative_reject,
+            "false_positive_reject": false_positive_reject,
+            "true_positive_reject": true_positive_reject,
+            "true_negative_reject": true_negative_reject,
+            "true_positive_fc": true_positive_fc,
+            "false_positive_fc": false_positive_fc,
+            "false_negative_fc": false_negative_fc,
+            "true_negative_fc": true_negative_fc,
+            "total_label_reject_cases": total_label_reject_cases,
+            "total_label_fc_cases": total_label_fc_cases,
+            "rejection_type_mismatch": rejection_type_mismatch,
+            "failed_generation": failed_generation,
+        }
+        yield trial, ctx
+
+
+def build_judge_requests(data: Dict, eval_config: Dict, tool_descriptions: Dict) -> Dict[str, Dict[str, Any]]:
+    """Per-scenario, build all argument-evaluation judge prompts grouped by trial.
+
+    Returns ``{trial: {"requests": [...messages...], "metadata": [...]}}``.
+    The harness fans the requests out through its standard judge pipeline
+    (one call per request) and then passes the responses to
+    ``score_with_judgements`` along with the same ``data`` / ``eval_config``
+    / ``tool_descriptions`` triple.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for trial, ctx in _walk_trials(data, eval_config, tool_descriptions):
+        if not ctx["llm_eligible_indices"]:
+            out[trial] = {"requests": [], "metadata": []}
+            continue
+        built = build_evaluation_requests(
+            ctx["llm_eligible_predicted"], ctx["llm_eligible_actual"], eval_config,
+            system_info=ctx["system_info"],
+            llm_history=ctx["llm_eligible_history"],
+            tool_descriptions=tool_descriptions,
+        )
+        out[trial] = {"requests": built["requests"], "metadata": built["metadata"]}
+    return out
+
+
+async def score_with_judgements(
+    data: Dict,
+    eval_config: Dict,
+    tool_descriptions: Dict,
+    judgements: Dict[str, List[Any]],
+) -> Dict:
+    """Same return shape as ``evaluate_sub_agent_history_f1`` but consumes
+    pre-cached judge responses instead of calling a live judge.
+
+    ``judgements[trial]`` is the response list aligned with the request list
+    from ``build_judge_requests(...)[trial]["requests"]`` — element ``i`` is
+    the judge's reply to request ``i``. Each response can be a raw string,
+    an OpenAI-style ``{"choices": [{"message": {"content": ...}}]}`` dict,
+    or any value ``extract_content_from_llm_result`` accepts.
+    """
+    return await _aggregate_trials(
+        data, eval_config, tool_descriptions,
+        judge_call=None, judgements=judgements,
+    )
+
+
+async def _aggregate_trials(
+    data: Dict,
+    eval_config: Dict,
+    tool_descriptions: Dict,
+    judge_call: JudgeCallable = None,
+    judgements: Dict[str, List[Any]] = None,
+    save_llm_results: bool = False,
+    output_dir: str = None,
+    file_identifier: str = None,
+) -> Dict:
+    """Shared trial-walking aggregation behind both the live-judge path
+    (``evaluate_sub_agent_history_f1``) and the pre-cached path
+    (``score_with_judgements``)."""
+    num_runs = len(data["history"])
+    totals = {
+        "key": 0.0, "fname": 0.0, "value": 0.0,
+        "rej_cases": 0.0, "fc_cases": 0.0,
+        "tp_rej": 0.0, "tn_rej": 0.0, "fp_rej": 0.0, "fn_rej": 0.0,
+        "tp_fc": 0, "fp_fc": 0, "fn_fc": 0, "tn_fc": 0,
+        "rej_mismatch": 0, "failed_gen": 0,
+        "perfect_calls": 0.0, "fc_succ": 0.0,
+    }
+    llm_failed_trials: List[str] = []
+
+    for trial, ctx in _walk_trials(data, eval_config, tool_descriptions):
+        totals["key"] += ctx["key_score_result"]["avg_f1"]
+        totals["fname"] += ctx["function_name_result"]["f1-score"]
+        totals["rej_cases"] += ctx["total_label_reject_cases"]
+        totals["fc_cases"] += ctx["total_label_fc_cases"]
+        totals["tp_rej"] += ctx["true_positive_reject"]
+        totals["tn_rej"] += ctx["true_negative_reject"]
+        totals["fp_rej"] += ctx["false_positive_reject"]
+        totals["fn_rej"] += ctx["false_negative_reject"]
+        totals["tp_fc"] += ctx["true_positive_fc"]
+        totals["fp_fc"] += ctx["false_positive_fc"]
+        totals["fn_fc"] += ctx["false_negative_fc"]
+        totals["tn_fc"] += ctx["true_negative_fc"]
+        totals["rej_mismatch"] += ctx["rejection_type_mismatch"]
+        totals["failed_gen"] += ctx["failed_generation"]
+
+        if judgements is not None:
+            value_score, perfect, success = await _value_score_from_judgements(
+                ctx, eval_config, tool_descriptions, judgements.get(trial, []),
+            )
+        else:
+            value_score, perfect, success = await calculate_argument_value_scores(
+                ctx["predicted_calls"], ctx["actual_calls"], ctx["histories"],
+                eval_config, ctx["system_info"], tool_descriptions,
+                save_llm_results, output_dir, file_identifier, trial,
+                ctx["key_score_result"], judge_call,
+            )
+        totals["perfect_calls"] += perfect
+        totals["value"] += value_score
+        totals["fc_succ"] += ctx["true_negative_reject"]
+        if not success:
+            llm_failed_trials.append(trial)
 
     return {
-        "total_perfect_function_calls": total_perfect_successful_calls,
-        "total_fc_successful_calls": total_all_fc_successful_calls,
-        "key_score": {"avg_f1": round(total_key_scores / num_runs, 4)},
-        "value_score_not_count_rejection": {"avg_f1": round(total_value_scores_without_rejection / num_runs, 4)},
-        "function_name_score": {"f1-score": round(total_function_name_scores / num_runs, 4)},
-        "total_rejection_cases": total_rejection_cases,
-        "total_true_positive_reject": total_true_positive_reject,
-        "total_true_negative_reject": total_true_negative_reject,
-        "total_false_positive_reject": total_false_positive_reject,
-        "total_false_negative_reject": total_false_negative_reject,
-        "total_true_positive_fc": total_true_positive_fc,  # FC True Positive 총계
-        "total_false_positive_fc": total_false_positive_fc,  # FC False Positive 총계
-        "total_false_negative_fc": total_false_negative_fc,  # FC False Negative 총계
-        "total_true_negative_fc": total_true_negative_fc,  # FC True Negative 총계
-        "total_rejection_type_mismatch": total_rejection_type_mismatch,  # Rejection 타입 불일치 총계
-        "total_failed_generation": total_failed_generation,  # 예측 생성 실패 총계
+        "total_perfect_function_calls": totals["perfect_calls"],
+        "total_fc_successful_calls": totals["fc_succ"],
+        "key_score": {"avg_f1": round(totals["key"] / num_runs, 4)},
+        "value_score_not_count_rejection": {"avg_f1": round(totals["value"] / num_runs, 4)},
+        "function_name_score": {"f1-score": round(totals["fname"] / num_runs, 4)},
+        "total_rejection_cases": totals["rej_cases"],
+        "total_true_positive_reject": totals["tp_rej"],
+        "total_true_negative_reject": totals["tn_rej"],
+        "total_false_positive_reject": totals["fp_rej"],
+        "total_false_negative_reject": totals["fn_rej"],
+        "total_true_positive_fc": totals["tp_fc"],
+        "total_false_positive_fc": totals["fp_fc"],
+        "total_false_negative_fc": totals["fn_fc"],
+        "total_true_negative_fc": totals["tn_fc"],
+        "total_rejection_type_mismatch": totals["rej_mismatch"],
+        "total_failed_generation": totals["failed_gen"],
         "llm_failed_trials": llm_failed_trials,
-        "total_function_call_cases": total_function_call_cases
+        "total_function_call_cases": totals["fc_cases"],
     }
+
+
+async def _value_score_from_judgements(
+    ctx: Dict,
+    eval_config: Dict,
+    tool_descriptions: Dict,
+    trial_judgements: List[Any],
+):
+    """Per-trial scoring path for ``score_with_judgements``: rebuild the
+    request metadata so we can pair pre-cached responses to call indices,
+    then merge with auto-only results.
+    """
+    detailed_value_score = [0.0] * len(ctx["predicted_calls"])
+    if not ctx["llm_eligible_indices"]:
+        return 0.0, 0, True
+
+    built = build_evaluation_requests(
+        ctx["llm_eligible_predicted"], ctx["llm_eligible_actual"], eval_config,
+        system_info=ctx["system_info"],
+        llm_history=ctx["llm_eligible_history"],
+        tool_descriptions=tool_descriptions,
+    )
+    metadata = built["metadata"]
+    auto_only = built["auto_only_results"]
+
+    if len(trial_judgements) < len(metadata):
+        logger.warning(
+            "trial received %d judgements but expected %d; missing entries scored as failures",
+            len(trial_judgements), len(metadata),
+        )
+        trial_judgements = list(trial_judgements) + [None] * (len(metadata) - len(trial_judgements))
+
+    results = process_evaluation_responses(metadata, trial_judgements[: len(metadata)], auto_only_results=auto_only)
+
+    # Map per-call results back onto the original eligible indices
+    sub_agent_index_to_orig = {p_idx: orig_idx for orig_idx, p_idx in enumerate(ctx["llm_eligible_indices"])}
+    for r in results:
+        sub_idx = r["call_index"]
+        if sub_idx in sub_agent_index_to_orig:
+            detailed_value_score[ctx["llm_eligible_indices"][sub_idx]] = r.get("f1", 0.0)
+
+    valid = [s for s in detailed_value_score if s > 0]
+    avg_value = sum(valid) / len(valid) if valid else 0.0
+
+    perfect = 0
+    detailed_key = ctx["key_score_result"]["detailed_key_score"]
+    for i in range(min(len(detailed_key), len(detailed_value_score))):
+        if (
+            detailed_key[i] == 1.0
+            and detailed_value_score[i] == 1.0
+            and not is_rejection_case(ctx["actual_calls"][i], "label")
+        ):
+            perfect += 1
+    return avg_value, perfect, True
+
 
 if __name__ == "__main__":
     import asyncio
