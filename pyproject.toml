@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ob-eval"
+version = "0.1.0"
+description = "Evaluation modules extracted from kakao/OrchestrationBench (Apache-2.0)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+  { name = "OrchestrationBench contributors" },
+]
+dependencies = [
+  "networkx>=3.0",
+  "PyYAML>=6.0",
+  "httpx>=0.24",
+]
+
+[project.urls]
+upstream = "https://github.com/kakao/OrchestrationBench"
+
+[tool.setuptools.packages.find]
+include = ["ob_eval*"]
