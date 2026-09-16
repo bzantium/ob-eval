@@ -772,10 +772,9 @@ async def _value_score_from_judgements(
     results = process_evaluation_responses(metadata, trial_judgements[: len(metadata)], auto_only_results=auto_only)
 
     # Map per-call results back onto the original eligible indices
-    sub_agent_index_to_orig = {p_idx: orig_idx for orig_idx, p_idx in enumerate(ctx["llm_eligible_indices"])}
     for r in results:
         sub_idx = r["call_index"]
-        if sub_idx in sub_agent_index_to_orig:
+        if 0 <= sub_idx < len(ctx["llm_eligible_indices"]):
             detailed_value_score[ctx["llm_eligible_indices"][sub_idx]] = r.get("f1", 0.0)
 
     valid = [s for s in detailed_value_score if s > 0]
